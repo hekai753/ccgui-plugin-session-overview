@@ -1,4 +1,4 @@
-// 会话总览（session-overview）—— CC GUI 插件 v0.1.0
+// 会话总览（session-overview）—— CC GUI 插件 v0.1.1
 // 跨工作区统一查看会话状态：需确认 / 进行中 / 未查看 / 已完成，点击直达对话。
 // 双入口：右侧面板（窄栏双行卡）+ 中央页签（宽视图）；宿主事件钩子探针用于后续接一手状态。
 // 单文件 ESM，禁止任何 import；组件用 ctx.react.createElement 构建。

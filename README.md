@@ -56,6 +56,7 @@
 
 ## 版本
 
+- **0.1.1** 补齐 manifest 必填字段（repo / license / minAppVersion）
 - **0.1.0** 首个公开发布：关注列表（需确认 / 进行中 / 未查看）、中央页签 + 右侧面板双入口、最后问答预览、实时状态（直读转录文件 mtime，快照落后时自动触发宿主重扫）、搜索、状态栏 chip、命令面板，支持 Claude Code 与 Codex 双引擎
 
 ## License
