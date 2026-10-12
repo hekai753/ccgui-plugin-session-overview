@@ -1,4 +1,4 @@
-// 会话总览（session-overview）—— CC GUI 插件 v0.1.1
+// 会话总览（session-overview）—— CC GUI 插件 v0.1.2
 // 跨工作区统一查看会话状态：需确认 / 进行中 / 未查看 / 已完成，点击直达对话。
 // 双入口：右侧面板（窄栏双行卡）+ 中央页签（宽视图）；宿主事件钩子探针用于后续接一手状态。
 // 单文件 ESM，禁止任何 import；组件用 ctx.react.createElement 构建。
@@ -43,6 +43,17 @@ export default function activate(ctx) {
     persistViewed();
     store.set({ vv: (store.get().vv || 0) + 1 }); // 让 React 感知已读状态变化
   }
+
+  // ---------- 固定状态 ----------
+  let pinned = new Set(); // key 集合；固定的会话即使已完成/已读也始终显示在关注列表
+
+  function togglePin(key) {
+    if (pinned.has(key)) pinned.delete(key); else pinned.add(key);
+    void ctx.storage.set("pinned", Array.from(pinned)).catch(() => {});
+    store.set({ vv: (store.get().vv || 0) + 1 });
+  }
+
+  const isPinned = (s) => pinned.has(keyOf(s));
 
   // ---------- 简单 store ----------
   const store = (() => {
@@ -312,7 +323,9 @@ export default function activate(ctx) {
 
   function sortByUrgency(list) {
     return list.slice().sort((a, b) =>
-      STATUS_ORDER[a.st] - STATUS_ORDER[b.st] || (b.updatedAt || 0) - (a.updatedAt || 0));
+      STATUS_ORDER[a.st] - STATUS_ORDER[b.st]
+      || ((isPinned(b) ? 1 : 0) - (isPinned(a) ? 1 : 0))
+      || (b.updatedAt || 0) - (a.updatedAt || 0));
   }
 
   function relTime(ts) {
@@ -343,9 +356,9 @@ export default function activate(ctx) {
     persistViewed();
   }
 
-  /** 视图过滤：attention = 需确认+进行中+未查看；recent = 近 7 天；all = 全部 */
+  /** 视图过滤：attention = 需确认+进行中+未查看+固定；recent = 近 7 天；all = 全部 */
   function applyView(list, view) {
-    if (view === "attention") return list.filter((s) => s.st !== "idle");
+    if (view === "attention") return list.filter((s) => s.st !== "idle" || pinned.has(keyOf(s)));
     if (view === "recent") {
       const cutoff = Date.now() - LOOKBACK_DAYS * 86400000;
       return list.filter((s) => (s.updatedAt || 0) >= cutoff);
@@ -400,12 +413,61 @@ export default function activate(ctx) {
       h("path", { d: "M13.4 2.6v3h-3" }));
   }
 
+  function PinIcon() {
+    return h("svg", {
+      viewBox: "0 0 16 16", width: 10, height: 10, fill: "currentColor", stroke: "none",
+    },
+      h("circle", { cx: 8, cy: 5, r: 3.1 }),
+      h("path", { d: "M8 8.6V14", stroke: "currentColor", strokeWidth: 1.7, strokeLinecap: "round", fill: "none" }));
+  }
+
+  // ---------- 右键菜单 ----------
+  function CtxMenu({ menu, onClose }) {
+    useEffect(() => {
+      if (!menu) return;
+      const onKey = (e) => { if (e.key === "Escape") onClose(); };
+      const close = () => onClose();
+      window.addEventListener("click", close, true);
+      window.addEventListener("scroll", close, true);
+      window.addEventListener("resize", close);
+      window.addEventListener("keydown", onKey);
+      return () => {
+        window.removeEventListener("click", close, true);
+        window.removeEventListener("scroll", close, true);
+        window.removeEventListener("resize", close);
+        window.removeEventListener("keydown", onKey);
+      };
+    }, [menu, onClose]);
+    if (!menu) return null;
+    const x = Math.min(menu.x, window.innerWidth - 160);
+    const y = Math.min(menu.y, window.innerHeight - 120);
+    return h("div", {
+      className: "sov-ctxmenu", style: { left: x, top: y },
+      onClick: (e) => e.stopPropagation(), onContextMenu: (e) => e.preventDefault(),
+    },
+      menu.items.map((it, i) =>
+        h("div", {
+          key: i, className: "sov-ctxitem",
+          onClick: () => { it.run(); onClose(); },
+        }, it.icon ? h("span", { className: "sov-ctxicon" }, it.icon) : null, h("span", null, it.label))));
+  }
+
   // ---------- 右侧面板（窄栏双行卡） ----------
   function PanelOverview() {
     const st = useStore();
     const [view, setView] = useState("attention");
     const [searchOpen, setSearchOpen] = useState(false);
     const [query, setQuery] = useState("");
+    const [menu, setMenu] = useState(null);
+
+    function openMenu(e, s) {
+      e.preventDefault();
+      e.stopPropagation();
+      const items = [{ label: isPinned(s) ? "解除固定" : "固定到关注列表", icon: h(PinIcon, null), run: () => togglePin(keyOf(s)) }];
+      if (s.st === "unviewed") items.push({ label: "标为已读", icon: "✓", run: () => markViewed(keyOf(s)) });
+      items.push({ label: "打开会话", icon: h(Icon, null), run: () => openSession(s) });
+      setMenu({ x: e.clientX, y: e.clientY, items });
+    }
 
     const cards = useMemo(() => {
       const withSt = st.sessions.map((s) => Object.assign({}, s, { st: displayStatus(s) }));
@@ -418,7 +480,7 @@ export default function activate(ctx) {
 
     const attentionCount = useMemo(() => {
       let n = 0;
-      st.sessions.forEach((s) => { if (displayStatus(s) !== "idle") n += 1; });
+      st.sessions.forEach((s) => { if (displayStatus(s) !== "idle" || isPinned(s)) n += 1; });
       return n;
     }, [st.sessions, st.vv]);
 
@@ -463,10 +525,12 @@ export default function activate(ctx) {
             className: "sov-card sov-st-" + s.st,
             title: s.title + "\n" + s.workspacePath,
             onClick: () => openSession(s),
+            onContextMenu: (e) => openMenu(e, s),
           },
             h("div", { className: "sov-card-top" },
               h("span", { className: "sov-dot" }),
               h("span", { className: "sov-card-title" + (s.st === "unviewed" ? " is-unread" : "") }, s.title),
+              isPinned(s) ? h("span", { className: "sov-pin", title: "已固定" }, h(PinIcon, null)) : null,
               s.st === "confirm" ? h("span", { className: "sov-confirm-text" }, "需确认") : null,
               (s.st === "unviewed" || s.st === "confirm")
                 ? h("button", {
@@ -479,7 +543,8 @@ export default function activate(ctx) {
             h("div", { className: "sov-card-sub" },
               h("span", { className: "sov-card-ws", title: s.workspacePath }, baseName(s.workspacePath)),
               h("span", null, s.engine),
-              h("span", null, relTime(s.updatedAt)))))));
+              h("span", null, relTime(s.updatedAt)))))),
+      h(CtxMenu, { menu, onClose: () => setMenu(null) }));
   }
 
   // ---------- 中央页签（宽视图） ----------
@@ -488,6 +553,16 @@ export default function activate(ctx) {
     const [view, setView] = useState("attention");
     const [query, setQuery] = useState("");
     const [collapsed, setCollapsed] = useState(() => new Set());
+    const [menu, setMenu] = useState(null);
+
+    function openMenu(e, s) {
+      e.preventDefault();
+      e.stopPropagation();
+      const items = [{ label: isPinned(s) ? "解除固定" : "固定到关注列表", icon: h(PinIcon, null), run: () => togglePin(keyOf(s)) }];
+      if (s.st === "unviewed") items.push({ label: "标为已读", icon: "✓", run: () => markViewed(keyOf(s)) });
+      items.push({ label: "打开会话", icon: h(Icon, null), run: () => openSession(s) });
+      setMenu({ x: e.clientX, y: e.clientY, items });
+    }
 
     const rows = useMemo(() => {
       const withSt = st.sessions.map((s) => Object.assign({}, s, { st: displayStatus(s) }));
@@ -504,7 +579,7 @@ export default function activate(ctx) {
       st.sessions.forEach((s) => {
         const k = displayStatus(s);
         c.all += 1;
-        if (k !== "idle") c.attention += 1;
+        if (k !== "idle" || isPinned(s)) c.attention += 1;
         if ((s.updatedAt || 0) >= cutoff) c.recent += 1;
         if (k in c) c[k] += 1;
       });
@@ -574,10 +649,12 @@ export default function activate(ctx) {
               className: "sov-row sov-st-" + s.st,
               title: s.title + "\n" + s.workspacePath,
               onClick: () => openSession(s),
+              onContextMenu: (e) => openMenu(e, s),
             },
               h("div", { className: "sov-row-main" },
                 h("span", { className: "sov-dot" }),
                 h("span", { className: "sov-row-title" + (s.st === "unviewed" ? " is-unread" : "") }, s.title),
+                isPinned(s) ? h("span", { className: "sov-pin", title: "已固定" }, h(PinIcon, null)) : null,
                 s.st === "confirm" ? h("span", { className: "sov-confirm-text" }, "需确认") : null,
                 h("span", { className: "sov-ws", title: s.workspacePath }, baseName(s.workspacePath)),
                 h("span", { className: "sov-badge" }, s.engine),
@@ -585,6 +662,7 @@ export default function activate(ctx) {
               s.q ? h("div", { className: "sov-row-qa", title: s.q }, h(QIcon, null), s.q) : null,
               (s.a && s.st !== "running") ? h("div", { className: "sov-row-qa sov-qa-ans", title: s.a }, h(AIcon, null), s.a) : null)));
       }),
+      h(CtxMenu, { menu, onClose: () => setMenu(null) }),
       h("details", { className: "sov-diag" },
         h("summary", null, "诊断信息"),
         h("div", { className: "sov-diag-body" },
@@ -649,6 +727,8 @@ export default function activate(ctx) {
       if (!disposed && v && typeof v === "object") viewedAt = new Map(Object.entries(v));
       const s = await ctx.storage.get("seeded");
       if (!disposed && s) seeded = true;
+      const pp = await ctx.storage.get("pinned");
+      if (!disposed && Array.isArray(pp)) pinned = new Set(pp);
       const p = await ctx.storage.get("probe");
       if (!disposed && p && typeof p === "object" && p.v === ctx.version) {
         if (Array.isArray(p.reads)) probe.reads = p.reads;
@@ -751,4 +831,9 @@ const CSS = `
 .sov-chip-confirm { color:var(--color-text-warning-primary, #b45309); font-weight:600; }
 .sov-chip-running { color:var(--color-status-streaming, #2f80ed); font-weight:600; }
 .sov-chip-unviewed { color:var(--color-status-unseen, #22c55e); font-weight:600; }
+.sov-pin { display:inline-flex; align-items:center; color:var(--color-text-tertiary, #8a8a8a); flex:none; }
+.sov-ctxmenu { position:fixed; z-index:2147483000; min-width:150px; padding:4px; background:var(--color-background-primary, #fff); border:1px solid var(--color-border-button-default, rgba(128,128,128,.25)); border-radius:8px; box-shadow:0 6px 24px rgba(0,0,0,.18); font-size:12px; color:var(--color-text-primary); }
+.sov-ctxitem { display:flex; align-items:center; gap:7px; padding:5px 9px; border-radius:5px; cursor:pointer; white-space:nowrap; }
+.sov-ctxitem:hover { background:var(--color-background-primary-hover, rgba(128,128,128,.12)); }
+.sov-ctxicon { display:inline-flex; color:var(--color-text-secondary, #888); }
 `;
