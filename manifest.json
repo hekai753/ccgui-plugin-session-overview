@@ -1,0 +1,27 @@
+{
+  "id": "session-overview",
+  "name": "会话总览",
+  "version": "0.1.0",
+  "icon": "docs/icon.png",
+  "screenshots": ["docs/screenshot.png"],
+  "tier": "js",
+  "author": "hekai753",
+  "repo": "hekai753/ccgui-plugin-session-overview",
+  "license": "MIT",
+  "description": "跨项目统一查看会话状态（需确认 / 进行中 / 未查看），关注列表 + 右侧面板与中央宽视图，点击直达对应对话",
+  "permissions": [
+    "ui:center-tab",
+    "ui:panel-tab",
+    "ui:sidebar-entry",
+    "ui:status-bar",
+    "ui:command",
+    "theme",
+    "host:session",
+    "exec:python3",
+    "storage",
+    "session.lifecycle.read",
+    "runtime.events.read",
+    "runtime.switch.observe",
+    "prompt.contribute.internal"
+  ]
+}

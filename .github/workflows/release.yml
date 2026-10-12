@@ -1,0 +1,40 @@
+# 会话总览插件发版工作流
+# 本插件为无构建的单文件 ESM（main.js 即产物），直接把两件套附加到 Release。
+# 硬性约定（见插件开发规范 §4.2/§9.2）：tag 必须等于 manifest.json 的 version，
+# 不带 v 前缀；Release 附件文件名固定为 main.js / manifest.json。
+name: Release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验 tag 与 manifest version 一致
+        run: |
+          VER=$(python3 -c "import json;print(json.load(open('manifest.json'))['version'])")
+          TAG="${GITHUB_REF_NAME}"
+          if [ "$VER" != "$TAG" ]; then
+            echo "::error::tag ($TAG) 与 manifest.json version ($VER) 不一致"
+            exit 1
+          fi
+
+      - name: 语法检查
+        run: node --check main.js
+
+      - name: 创建 Release 并附加产物
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            main.js
+            manifest.json
