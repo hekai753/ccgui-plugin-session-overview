@@ -1,4 +1,4 @@
-// 会话总览（session-overview）—— CC GUI 插件 v0.1.2
+// 会话总览（session-overview）—— CC GUI 插件 v0.1.3
 // 跨工作区统一查看会话状态：需确认 / 进行中 / 未查看 / 已完成，点击直达对话。
 // 双入口：右侧面板（窄栏双行卡）+ 中央页签（宽视图）；宿主事件钩子探针用于后续接一手状态。
 // 单文件 ESM，禁止任何 import；组件用 ctx.react.createElement 构建。
@@ -156,13 +156,17 @@ export default function activate(ctx) {
     "now_ms = time.time() * 1000.0",
     "cutoff_days = (time.time() - DAYS * 86400.0) * 1000.0 if DAYS > 0 else 0",
     "sql = ('SELECT s.engine, s.session_id, s.workspace_path, s.title, s.preview, '",
-    "       's.updated_at, s.message_count, s.file_path, s.file_mtime_ms '",
+    "       's.updated_at, s.message_count, s.file_path, s.file_mtime_ms, s.custom_title '",
     "       'FROM sessions s WHERE s.message_count > 0 AND NOT EXISTS '",
     "       '(SELECT 1 FROM session_archives a WHERE a.engine=s.engine AND a.session_id=s.session_id)')",
     "sql += ' AND (COALESCE(s.updated_at, s.file_mtime_ms, 0) >= ? OR COALESCE(s.updated_at, s.file_mtime_ms, 0) >= ?)'",
     "sql += ' ORDER BY COALESCE(s.updated_at, s.file_mtime_ms, 0) DESC LIMIT 300'",
     "try:",
     "    rows = con.execute(sql, (cutoff_days, VMIN)).fetchall()",
+    "except sqlite3.OperationalError:",
+    "    # 老版本宿主 DB 无 custom_title 列",
+    "    rows = [r + (None,) for r in con.execute(sql.replace(', s.custom_title ', ' '),",
+    "                                              (cutoff_days, VMIN)).fetchall()]",
     "finally:",
     "    con.close()",
     "def analyze_tail(path):",
@@ -217,9 +221,27 @@ export default function activate(ctx) {
     "    except Exception:",
     "        pass",
     "    return pend, last_user, q, a",
+    "branches = {}",
+    "def git_branch(ws):",
+    "    # 读 .git/HEAD 解析当前分支（不启 git 子进程）；worktree 的 .git 是文件",
+    "    if not ws: return ''",
+    "    if ws in branches: return branches[ws]",
+    "    b = ''",
+    "    try:",
+    "        gp = os.path.join(ws, '.git')",
+    "        if os.path.isfile(gp):",
+    "            with open(gp) as f: t = f.read().strip()",
+    "            gp = os.path.join(ws, t[7:].strip()) if t.startswith('gitdir:') else ''",
+    "        if gp and os.path.isdir(gp):",
+    "            with open(os.path.join(gp, 'HEAD')) as f: t = f.read().strip()",
+    "            b = t[16:] if t.startswith('ref: refs/heads/') else t[:8]",
+    "    except Exception: b = ''",
+    "    branches[ws] = b",
+    "    return b",
     "out = []",
     "live_max = 0; db_max = 0",
-    "for engine, sid, ws, title, preview, updated_at, mc, fp, mtime in rows:",
+    "for engine, sid, ws, title, preview, updated_at, mc, fp, mtime, custom_title in rows:",
+    "    title = custom_title or title  # 用户重命名的会话优先显示自定义标题",
     "    db_mtime = mtime or updated_at or 0",
     "    if db_mtime > db_max: db_max = db_mtime",
     "    live_ms = 0",
@@ -242,9 +264,10 @@ export default function activate(ctx) {
     "        status = 'idle'",
     "    t = title or preview or ''",
     "    t = ' '.join(t.split())[:80] or '(无标题)'",
+    "    br = git_branch(ws)",
     "    out.append({'engine': engine, 'sessionId': sid, 'workspacePath': ws or '',",
     "                'title': t, 'updatedAt': mtime, 'messageCount': mc, 'status': status,",
-    "                'q': q, 'a': a})",
+    "                'q': q, 'a': a, 'branch': br})",
     "print(json.dumps({'db': True, 'liveMax': live_max, 'dbMax': db_max, 'sessions': out}, separators=(',', ':')))",
   ].join("\n");
 
@@ -285,6 +308,16 @@ export default function activate(ctx) {
           recomputeVmin();
         }
         store.set({ loading: false, error: null, dbMissing: data.db === false, sessions, lastUpdate: Date.now() });
+        // 顺带同步 pinned（防多入口/多窗口各自改过 storage 后互相看不见）
+        void ctx.storage.get("pinned").then((pp) => {
+          if (!disposed && Array.isArray(pp)) {
+            const next = pp.join("|");
+            if (next !== Array.from(pinned).join("|")) {
+              pinned = new Set(pp);
+              store.set({ vv: (store.get().vv || 0) + 1 });
+            }
+          }
+        }).catch(() => {});
         // 宿主快照落后（转录文件比 DB 记录新 ≥5s）时礼貌触发宿主重扫，
         // 让标题/预览也跟上；限频 45s，重活交给宿主的 SCAN_RUNNING 去重。
         if (!disposed && data.liveMax && data.liveMax > (data.dbMax || 0) + 5000
@@ -323,8 +356,8 @@ export default function activate(ctx) {
 
   function sortByUrgency(list) {
     return list.slice().sort((a, b) =>
-      STATUS_ORDER[a.st] - STATUS_ORDER[b.st]
-      || ((isPinned(b) ? 1 : 0) - (isPinned(a) ? 1 : 0))
+      ((isPinned(b) ? 1 : 0) - (isPinned(a) ? 1 : 0))
+      || STATUS_ORDER[a.st] - STATUS_ORDER[b.st]
       || (b.updatedAt || 0) - (a.updatedAt || 0));
   }
 
@@ -426,7 +459,12 @@ export default function activate(ctx) {
     useEffect(() => {
       if (!menu) return;
       const onKey = (e) => { if (e.key === "Escape") onClose(); };
-      const close = () => onClose();
+      // 点在菜单内部时不关闭（捕获阶段先于菜单项 onClick，直接关会抢在
+      // run 之前卸载菜单，导致菜单项点击失效）
+      const close = (e) => {
+        if (e && e.target && e.target.closest && e.target.closest(".sov-ctxmenu")) return;
+        onClose();
+      };
       window.addEventListener("click", close, true);
       window.addEventListener("scroll", close, true);
       window.addEventListener("resize", close);
@@ -439,6 +477,8 @@ export default function activate(ctx) {
       };
     }, [menu, onClose]);
     if (!menu) return null;
+    let acted = false;
+    const act = (it) => { if (acted) return; acted = true; it.run(); onClose(); };
     const x = Math.min(menu.x, window.innerWidth - 160);
     const y = Math.min(menu.y, window.innerHeight - 120);
     return h("div", {
@@ -448,7 +488,9 @@ export default function activate(ctx) {
       menu.items.map((it, i) =>
         h("div", {
           key: i, className: "sov-ctxitem",
-          onClick: () => { it.run(); onClose(); },
+          // pointerdown 先于任何关闭/卸载逻辑，click 兜底；一次性标志防双触发
+          onPointerDown: (e) => { e.preventDefault(); act(it); },
+          onClick: (e) => { e.preventDefault(); act(it); },
         }, it.icon ? h("span", { className: "sov-ctxicon" }, it.icon) : null, h("span", null, it.label))));
   }
 
@@ -477,6 +519,17 @@ export default function activate(ctx) {
         (s.title || "").toLowerCase().includes(q) || (s.workspacePath || "").toLowerCase().includes(q));
       return list;
     }, [st.sessions, st.vv, view, query]); // eslint-disable-line
+
+    // 按工作区分组；组间顺序 = 紧急度排序中的首次出现（固定项所在组自然靠前）
+    const pgroups = useMemo(() => {
+      const m = new Map();
+      cards.forEach((s) => {
+        const ws = s.workspacePath || "(未知工作区)";
+        if (!m.has(ws)) m.set(ws, []);
+        m.get(ws).push(s);
+      });
+      return Array.from(m.entries());
+    }, [cards]);
 
     const attentionCount = useMemo(() => {
       let n = 0;
@@ -519,7 +572,12 @@ export default function activate(ctx) {
             view === "attention" ? "没有需要关注的会话 ✓" : "没有匹配的会话。")
         : null,
       h("div", { className: "sov-cards" },
-        cards.map((s) =>
+        pgroups.map(([ws, list]) =>
+          h("div", { className: "sov-pgroup", key: ws },
+            h("div", { className: "sov-pgroup-h", title: ws },
+              h("span", { className: "sov-pgroup-name" }, baseName(ws)),
+              h("span", { className: "sov-pgroup-count" }, list.length + " 个")),
+            list.map((s) =>
           h("div", {
             key: keyOf(s),
             className: "sov-card sov-st-" + s.st,
@@ -543,7 +601,8 @@ export default function activate(ctx) {
             h("div", { className: "sov-card-sub" },
               h("span", { className: "sov-card-ws", title: s.workspacePath }, baseName(s.workspacePath)),
               h("span", null, s.engine),
-              h("span", null, relTime(s.updatedAt)))))),
+              s.branch ? h("span", { className: "sov-branch", title: "分支 " + s.branch }, s.branch) : null,
+              h("span", null, relTime(s.updatedAt)))))))),
       h(CtxMenu, { menu, onClose: () => setMenu(null) }));
   }
 
@@ -658,6 +717,7 @@ export default function activate(ctx) {
                 s.st === "confirm" ? h("span", { className: "sov-confirm-text" }, "需确认") : null,
                 h("span", { className: "sov-ws", title: s.workspacePath }, baseName(s.workspacePath)),
                 h("span", { className: "sov-badge" }, s.engine),
+                s.branch ? h("span", { className: "sov-branch", title: "分支 " + s.branch }, s.branch) : null,
                 h("span", { className: "sov-meta" }, relTime(s.updatedAt))),
               s.q ? h("div", { className: "sov-row-qa", title: s.q }, h(QIcon, null), s.q) : null,
               (s.a && s.st !== "running") ? h("div", { className: "sov-row-qa sov-qa-ans", title: s.a }, h(AIcon, null), s.a) : null)));
@@ -667,6 +727,7 @@ export default function activate(ctx) {
         h("summary", null, "诊断信息"),
         h("div", { className: "sov-diag-body" },
           h("div", null, "host " + ctx.host.appVersion + " · sdk " + ctx.host.sdkVersion + " · 插件 " + ctx.version),
+          h("div", null, "固定会话 " + pinned.size + " 个" + (pinned.size ? "：" + Array.from(pinned).join("、") : "")),
           h("div", null, "钩子注册：" + (probe.ok.length ? probe.ok.join("、") : "（无）")),
           h("div", null, "钩子键名读取：" + (probe.reads.length ? probe.reads.join(", ") : "（尚未捕获，重启应用后再看）")),
           probe.calls.length
@@ -688,7 +749,7 @@ export default function activate(ctx) {
     return h("button", {
       className: "sov-statusbar-chip",
       title: "会话总览" + (st.lastUpdate ? "（更新于 " + relTime(st.lastUpdate) + "）" : ""),
-      onClick: () => ctx.ui.openCenterTab("overview"),
+      onClick: () => openOverview(),
     },
       h(Icon, null),
       confirm + running + unviewed > 0
@@ -702,6 +763,31 @@ export default function activate(ctx) {
   // ---------- 注册扩展点 ----------
   ctx.ui.registerPanelTab({ key: "overview", label: () => "会话总览", icon: Icon, component: PanelOverview });
   ctx.ui.registerCenterTab({ key: "overview", title: () => "会话总览", icon: Icon, component: CenterOverview });
+
+  // 激活聊天页右侧面板的本插件页签。宿主未提供编程激活 API（panelTab 是
+  // useLayoutPanels 的内部 state），这里找到页签条里的 pill 按钮派发点击。
+  // 不依赖 i18n 文案：右侧 PillTab 有 aria-pressed，中央页签按钮没有，以此
+  // 区分；面板是否折叠用自己的 .sov-panel 是否可见判断（页签条折叠时宽度
+  // 为 0 但仍挂载），折叠时按结构（chrome 容器的前一个兄弟按钮）找切换钮。
+  // 找不到 pill（如主页无聊天面板）则回落到中央页签。
+  function openOverview() {
+    try {
+      const pills = Array.from(
+        document.querySelectorAll('button[aria-label="会话总览"][aria-pressed]'));
+      if (pills.length) {
+        const body = document.querySelector(".sov-panel");
+        if (body && body.getClientRects().length === 0) {
+          const chrome = pills[0].closest("div[style*='width']");
+          const toggle = chrome && chrome.parentElement && chrome.parentElement.previousElementSibling;
+          if (toggle && toggle.tagName === "BUTTON") toggle.click();
+        }
+        pills[pills.length - 1].click();
+        return;
+      }
+    } catch (e) { /* DOM 结构变化时走中央页签 */ }
+    ctx.ui.openCenterTab("overview");
+  }
+
   ctx.ui.registerSidebarNav({
     key: "overview", label: () => "会话总览", icon: Icon, order: 50,
     onOpen: () => ctx.ui.openCenterTab("overview"),
@@ -783,12 +869,19 @@ const CSS = `
 
 /* 右侧面板：双行紧凑卡 */
 .sov-cards { display:flex; flex-direction:column; gap:3px; }
+.sov-pgroup-h { display:flex; align-items:center; gap:6px; padding:4px 8px; margin:6px 6px 2px; font-size:11px; border-radius:6px; background:var(--color-background-primary-hover, rgba(128,128,128,.12)); color:var(--color-text-secondary, #555); }
+.sov-pgroup-name { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:700; }
+.sov-pgroup-name::before { content:""; display:inline-block; width:3px; height:9px; border-radius:2px; background:var(--color-status-streaming, #2f80ed); margin-right:6px; vertical-align:-1px; }
+.sov-pgroup-count { flex:none; opacity:.75; }
 .sov-card { display:flex; flex-direction:column; gap:2px; padding:7px 9px; border-radius:8px; cursor:pointer; }
 .sov-card:hover { background:var(--color-background-primary-hover, rgba(128,128,128,.1)); }
 .sov-card-top { display:flex; align-items:center; gap:7px; min-width:0; }
 .sov-card-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:500; }
 .sov-card-title.is-unread { font-weight:700; }
-.sov-card-sub { display:flex; align-items:center; gap:8px; padding-left:14px; font-size:11px; color:var(--color-text-tertiary, #999); }
+.sov-card-sub { display:flex; align-items:center; flex-wrap:nowrap; gap:8px; padding-left:14px; font-size:11px; color:var(--color-text-tertiary, #999); }
+.sov-card-sub > span { white-space:nowrap; }
+.sov-card-sub > span:first-child { flex:0 1 auto; min-width:0; }
+.sov-card-sub > span:not(:first-child) { flex:none; }
 .sov-card-qa, .sov-row-qa {
   position:relative; padding-left:20px; font-size:11px; line-height:1.5;
   color:var(--color-text-secondary, #aaa);
@@ -831,9 +924,10 @@ const CSS = `
 .sov-chip-confirm { color:var(--color-text-warning-primary, #b45309); font-weight:600; }
 .sov-chip-running { color:var(--color-status-streaming, #2f80ed); font-weight:600; }
 .sov-chip-unviewed { color:var(--color-status-unseen, #22c55e); font-weight:600; }
-.sov-pin { display:inline-flex; align-items:center; color:var(--color-text-tertiary, #8a8a8a); flex:none; }
+.sov-pin { display:inline-flex; align-items:center; color:var(--color-status-streaming, #2f80ed); flex:none; }
 .sov-ctxmenu { position:fixed; z-index:2147483000; min-width:150px; padding:4px; background:var(--color-background-primary, #fff); border:1px solid var(--color-border-button-default, rgba(128,128,128,.25)); border-radius:8px; box-shadow:0 6px 24px rgba(0,0,0,.18); font-size:12px; color:var(--color-text-primary); }
 .sov-ctxitem { display:flex; align-items:center; gap:7px; padding:5px 9px; border-radius:5px; cursor:pointer; white-space:nowrap; }
 .sov-ctxitem:hover { background:var(--color-background-primary-hover, rgba(128,128,128,.12)); }
 .sov-ctxicon { display:inline-flex; color:var(--color-text-secondary, #888); }
+.sov-branch { color:var(--color-text-tertiary, #8a8a8a); font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:11px; max-width:35%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 `;
